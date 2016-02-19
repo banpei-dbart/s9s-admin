@@ -1,0 +1,184 @@
+#!/bin/bash
+
+VERBOSE=0
+CMON=0
+REPORT_DIR=`pwd`
+
+function parse_json()
+{
+    echo $1 | \
+    sed -e 's/[{}]/''/g' | \
+    sed -e 's/", "/'\",\"'/g' | \
+    sed -e 's/" ,"/'\",\"'/g' | \
+    sed -e 's/" , "/'\",\"'/g' | \
+    sed -e 's/","/'\"---SEPERATOR---\"'/g' | \
+    awk -F=':' -v RS='---SEPERATOR---' "\$1~/\"$2\"/ {print}" | \
+    sed -e "s/\"$2\"://" | \
+    tr -d "\n\t" | \
+    sed -e 's/\\"/"/g' | \
+    sed -e 's/\\\\/\\/g' | \
+    sed -e 's/^[ \t]*//g' | \
+    sed -e 's/^"//'  -e 's/"$//'
+}
+
+
+
+header() {
+  echo $1
+  echo "=============================================="
+}
+
+footer() {
+  echo "=============================================="
+  echo
+}
+
+cmon_version() {
+  header "CMON version"
+  CMON_VERSION=`grep -m 1 'cmon_version' "${REPORT_DIR}/controller/hosts" | sed -e 's/.*cmon_version: \(.*\)$/\1/'`
+  if [ ! -z ${CMON_VERSION} ]; then
+    echo "- CMON Version: $CMON_VERSION"
+  fi
+  footer
+}
+
+mycnf_diff() {
+  header "Differences in the my.cnf files"
+
+  # Create an array of the my.cnf files
+  MYCNFS=$(find ${REPORT_DIR} -type f -name 'my.cnf')
+  first_cnf=""
+  for file in $MYCNFS; do
+    if [ $first_cnf -z ]; then
+      first_cnf=$file
+    else
+      diff -Bbr -U 0 $first_cnf $file
+    fi
+  done
+
+  footer
+}
+
+
+cmon_errors() {
+  header "Last 20 CMON errors in cmon logs"
+
+  grep 'ERROR' "${REPORT_DIR}/controller/cmon_${CLUSTER_ID}.log" | tail -20
+
+  footer
+}
+
+cmon_last_restart() {
+  header "Last restarts of CMON"
+
+  NEWDATES=()
+  IFS_BAK=${IFS}
+  IFS="
+"
+  # Find all the dates within the cmon log files
+  DATES=( $(grep 'Starting cmon version' -r ${REPORT_DIR}/controller/cmon_1.log* | sed -e 's/^[^:]*:\(.*\) : (INFO).*/\1/') )
+
+  # Convert the dates into Unix timestamps to be able to sort them
+  for date in ${DATES[@]}; do
+    dateconv="date -jf '%b %d %H:%M:%S' '${date}' '+%s'"
+    newdate=`eval $dateconv`
+    NEWDATES+=($newdate)
+  done
+  IFS=${IFS_BAK}
+
+  # Now sort them and display them in Hungarian/Japanese notation for better readability
+  sorted=($(printf '%s\n' "${NEWDATES[@]}"|sort -r))
+  for i in {0..10}; do
+    if [ ! -z "${sorted[$i]}" ]; then
+      dateconv="date -jf '%s' '${sorted[$i]}' '+%Y-%m-%d %H:%M:%S'"
+      echo `eval $dateconv`
+    fi
+  done
+
+  footer
+}
+
+cluster_info() {
+  header "Cluster info"
+
+  # Find number of items in cluster
+  items=`grep 'total' "${REPORT_DIR}/controller/getHosts" | sed -e 's/"total": \(.*\)/\1/'`
+  i=0;
+  while [ "$i" -lt "$items" ]; do
+    # Python needed to parse JSON. No possibility to output everything at once, so multiple parses are necessary
+    typecode="import json,sys;obj=json.load(sys.stdin); print obj['data'][${i}]['nodetype'];"
+    hostnamecode="import json,sys;obj=json.load(sys.stdin); print obj['data'][${i}]['hostname'];"
+    versioncode="import json,sys;obj=json.load(sys.stdin); print obj['data'][${i}]['version'];"
+    rolecode="import json,sys;obj=json.load(sys.stdin); print obj['data'][${i}]['role'];"
+    statuscode="import json,sys;obj=json.load(sys.stdin); print obj['data'][${i}]['status'];"
+
+    node_nodetype=`cat "${REPORT_DIR}/controller/getHosts" | python -c "${typecode}"`
+    node_hostname=`cat "${REPORT_DIR}/controller/getHosts" | python -c "${hostnamecode}"`
+    node_status=`cat "${REPORT_DIR}/controller/getHosts" | python -c "${statuscode}"`
+    if [ ! -z $node_nodetype ] && [ $node_nodetype == "galera" -o $node_nodetype == "mysql" -o $node_nodetype == "postgres" -o $node_nodetype == "mongodb" ]; then
+      node_version=`cat "${REPORT_DIR}/controller/getHosts" | python -c "${versioncode}"`
+      node_role=`cat "${REPORT_DIR}/controller/getHosts" | python -c "${rolecode}"`
+    else
+      node_role=""
+      node_version=""
+    fi
+    echo "Hostname: $node_hostname"
+    if [ ! -z $node_role ]; then
+      echo "- type: $node_nodetype, role: $node_role"
+      echo "- version: $node_version"
+    else
+      echo "- type: $node_nodetype"
+    fi
+    i=$((i+1))
+  done
+
+  footer
+}
+
+while [[ $# > 0  ]]; do
+    arg="$1"
+    case "$arg" in
+        -v|--verbose)
+            VERBOSE=1
+            shift
+            ;;
+        --report_dir)
+            shift
+            REPORT_DIR=$1
+            ;;
+        --cmon)
+            CMON=1
+            ;;
+        *)
+            echo "=> Unknown option $arg"
+            exit 1
+            ;;
+    esac
+    shift
+done
+
+if [ -z REPORT_DIR ]; then
+  echo "No report directory given."
+  exit
+fi
+
+header "Fetching the cluster ID from the config"
+CMONCNF=$(find ${REPORT_DIR} -type f -name 'cmon_*.cnf')
+if [ ! -z $CMONCNF ]; then
+  CLUSTER_ID=`grep 'cluster_id' $CMONCNF | sed -e 's/^cluster_id=\(.*\)/\1/'`
+  echo "- Cluster ID: ${CLUSTER_ID}"
+else
+  echo "- Could not find the cluster ID!"
+  echo "- Check if the cmon_<cluster>.cnf is present in the error report and try again."
+  exit
+fi
+footer
+
+if [ $CMON -eq 1 ]; then
+  cmon_version
+  cmon_last_restart
+  cluster_info
+  cmon_errors
+fi
+
+
