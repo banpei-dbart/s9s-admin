@@ -4,25 +4,6 @@ VERBOSE=0
 CMON=0
 REPORT_DIR=`pwd`
 
-function parse_json()
-{
-    echo $1 | \
-    sed -e 's/[{}]/''/g' | \
-    sed -e 's/", "/'\",\"'/g' | \
-    sed -e 's/" ,"/'\",\"'/g' | \
-    sed -e 's/" , "/'\",\"'/g' | \
-    sed -e 's/","/'\"---SEPERATOR---\"'/g' | \
-    awk -F=':' -v RS='---SEPERATOR---' "\$1~/\"$2\"/ {print}" | \
-    sed -e "s/\"$2\"://" | \
-    tr -d "\n\t" | \
-    sed -e 's/\\"/"/g' | \
-    sed -e 's/\\\\/\\/g' | \
-    sed -e 's/^[ \t]*//g' | \
-    sed -e 's/^"//'  -e 's/"$//'
-}
-
-
-
 header() {
   echo $1
   echo "=============================================="
@@ -34,12 +15,10 @@ footer() {
 }
 
 cmon_version() {
-  header "CMON version"
   CMON_VERSION=`grep -m 1 'cmon_version' "${REPORT_DIR}/controller/hosts" | sed -e 's/.*cmon_version: \(.*\)$/\1/'`
   if [ ! -z ${CMON_VERSION} ]; then
     echo "- CMON Version: $CMON_VERSION"
   fi
-  footer
 }
 
 mycnf_diff() {
@@ -63,7 +42,7 @@ mycnf_diff() {
 cmon_errors() {
   header "Last 20 CMON errors in cmon logs"
 
-  grep 'ERROR' "${REPORT_DIR}/controller/cmon_${CLUSTER_ID}.log" | tail -20
+  grep 'ERROR' "${REPORT_DIR}/controller/cmon${CLUSTER_PREPEND}.log" | tail -20
 
   footer
 }
@@ -76,8 +55,7 @@ cmon_last_restart() {
   IFS="
 "
   # Find all the dates within the cmon log files
-  DATES=( $(grep 'Starting cmon version' -r ${REPORT_DIR}/controller/cmon_1.log* | sed -e 's/^[^:]*:\(.*\) : (INFO).*/\1/') )
-
+  DATES=( $(grep 'Starting cmon version' -r ${REPORT_DIR}/controller/cmon${CLUSTER_PREPEND}.log* | sed -e 's/^[^:]*:\(.*\) : (INFO).*/\1/') )
   # Convert the dates into Unix timestamps to be able to sort them
   for date in ${DATES[@]}; do
     dateconv="date -jf '%b %d %H:%M:%S' '${date}' '+%s'"
@@ -90,8 +68,15 @@ cmon_last_restart() {
   sorted=($(printf '%s\n' "${NEWDATES[@]}"|sort -r))
   for i in {0..10}; do
     if [ ! -z "${sorted[$i]}" ]; then
+      # Find also the version the restart has been performed on. Not the nicest way to do this...
+      old_date_conv="date -jf '%s' '${sorted[$i]}' '+%b %d %H:%M:%S'"
+      old_date=`eval $old_date_conv`
+      cmon_version_conv="grep '${old_date} : (INFO) Starting cmon version' -r ${REPORT_DIR}/controller/cmon${CLUSTER_PREPEND}.log* | sed -e 's/^.*(INFO) Starting cmon version \(.*\) with the following parameters.*/\1/'"
+      cmon_version=`eval $cmon_version_conv`
+
       dateconv="date -jf '%s' '${sorted[$i]}' '+%Y-%m-%d %H:%M:%S'"
-      echo `eval $dateconv`
+      date_restart=`eval $dateconv`
+      echo "- ${date_restart} (cmon version ${cmon_version})"
     fi
   done
 
@@ -100,40 +85,135 @@ cmon_last_restart() {
 
 cluster_info() {
   header "Cluster info"
+  cmon_version
+  echo
 
   # Find number of items in cluster
+  hosts_file="${REPORT_DIR}/controller/getHosts"
   items=`grep 'total' "${REPORT_DIR}/controller/getHosts" | sed -e 's/"total": \(.*\)/\1/'`
-  i=0;
-  while [ "$i" -lt "$items" ]; do
-    # Python needed to parse JSON. No possibility to output everything at once, so multiple parses are necessary
-    typecode="import json,sys;obj=json.load(sys.stdin); print obj['data'][${i}]['nodetype'];"
-    hostnamecode="import json,sys;obj=json.load(sys.stdin); print obj['data'][${i}]['hostname'];"
-    versioncode="import json,sys;obj=json.load(sys.stdin); print obj['data'][${i}]['version'];"
-    rolecode="import json,sys;obj=json.load(sys.stdin); print obj['data'][${i}]['role'];"
-    statuscode="import json,sys;obj=json.load(sys.stdin); print obj['data'][${i}]['status'];"
+  if [ -z "$items" ]; then
+    echo "! Error while parsing the ${REPORT_DIR}/controller/getHosts file."
+    error_string=`grep 'errorString' ${REPORT_DIR}/controller/getHosts | sed -e 's/"errorString": \(.*\)/\1/'`
+    echo "! Error found: ${error_string}"
+    echo "Attempting to detect cluster topology in a different way."
+    
+    # Create a temporary file with the exact same contents
+    hosts_file="${REPORT_DIR}/controller/tmpGetHosts"
+    cat ${REPORT_DIR}/controller/server_node  | grep -vE '(id:)|(cid:)|(class_name:)|(hostname:)|(port:)|(properties:)' | sed -e 's/^\** 1. row \**/{"cc_timestamp": 1455534729,"data": [ {/' | sed -e 's/^\**.*row.*\**/,{/' > ${hosts_file}
+    items=`grep 'hostname' ${hosts_file} | wc -l`
+    echo "], \"total\": ${items} }" >> ${hosts_file}
+  fi
+    i=0;
+    while [ "$i" -lt "$items" ]; do
+      # Python needed to parse JSON. No possibility to output everything at once, so multiple parses are necessary
+      typecode="import json,sys;obj=json.load(sys.stdin); print obj['data'][${i}]['nodetype'];"
+      hostnamecode="import json,sys;obj=json.load(sys.stdin); print obj['data'][${i}]['hostname'];"
+      versioncode="import json,sys;obj=json.load(sys.stdin); print obj['data'][${i}]['version'];"
+      rolecode="import json,sys;obj=json.load(sys.stdin); print obj['data'][${i}]['role'];"
+      statuscode="import json,sys;obj=json.load(sys.stdin); print obj['data'][${i}]['status'];"
+      ostypecode="import json,sys;obj=json.load(sys.stdin); print obj['data'][${i}]['distribution']['name'];"
+      osvercode="import json,sys;obj=json.load(sys.stdin); print obj['data'][${i}]['distribution']['release'];"
 
-    node_nodetype=`cat "${REPORT_DIR}/controller/getHosts" | python -c "${typecode}"`
-    node_hostname=`cat "${REPORT_DIR}/controller/getHosts" | python -c "${hostnamecode}"`
-    node_status=`cat "${REPORT_DIR}/controller/getHosts" | python -c "${statuscode}"`
-    if [ ! -z $node_nodetype ] && [ $node_nodetype == "galera" -o $node_nodetype == "mysql" -o $node_nodetype == "postgres" -o $node_nodetype == "mongodb" ]; then
-      node_version=`cat "${REPORT_DIR}/controller/getHosts" | python -c "${versioncode}"`
-      node_role=`cat "${REPORT_DIR}/controller/getHosts" | python -c "${rolecode}"`
-    else
-      node_role=""
-      node_version=""
-    fi
-    echo "Hostname: $node_hostname"
-    if [ ! -z $node_role ]; then
-      echo "- type: $node_nodetype, role: $node_role"
-      echo "- version: $node_version"
-    else
-      echo "- type: $node_nodetype"
-    fi
-    i=$((i+1))
-  done
+      node_nodetype=`cat "${hosts_file}" | python -c "${typecode}"`
+      node_hostname=`cat "${hosts_file}" | python -c "${hostnamecode}"`
+      node_status=`cat "${hosts_file}" | python -c "${statuscode}"`
+      node_ostype=`cat "${hosts_file}" | python -c "${ostypecode}"`
+      node_osver=`cat "${hosts_file}" | python -c "${osvercode}"`
+      if [ ! -z $node_nodetype ] && [ $node_nodetype == "galera" -o $node_nodetype == "mysql" -o $node_nodetype == "postgres" -o $node_nodetype == "mongodb" ]; then
+        node_version=`cat "${hosts_file}" | python -c "${versioncode}"`
+        node_role=`cat "${hosts_file}" | python -c "${rolecode}"`
+      else
+        node_role=""
+        node_version=""
+      fi
+      echo "Hostname: $node_hostname"
+      if [ ! -z $node_role ]; then
+        echo "- type: $node_nodetype, role: $node_role"
+        echo "- OS: $node_ostype $node_osver"
+        host_spec $node_hostname
+        if [ $node_nodetype == "galera" -o $node_nodetype == "mysql" ]; then
+          echo "- MySQL version: $node_version"
+          check_mysql_variables $node_hostname
+        fi
+      else
+        echo "- type: $node_nodetype"
+        echo "- OS: $node_ostype $node_osver"
+        host_spec $node_hostname
+      fi
+  
+ 
+      i=$((i+1))
+    done
 
   footer
 }
+
+check_mysql_variables() {
+  host=$1
+  file=$(find "${REPORT_DIR}/${host}" -type f -name 'my.cnf')
+  if [ -z "${file}" ]; then
+    echo "! my.cnf is missing for this host!"
+    return
+  fi
+  lines=`wc -l ${file} | awk '{print $1}'`
+  if [ "$lines" -eq 0 ]; then
+    echo "! Empty my.cnf file (${file})"
+    return
+  fi
+
+
+  # Create an array of the my.cnf files
+  echo "- Checking my.cnf ($file)"
+  # Check for disabling query cache, without switching it off
+  query_cache_size=( $(grep 'query_cache_size' "${file}" | sed -e 's/^[^=]*=\(.*\).*/\1/' | tr -d '[[:space:]]') )
+  query_cache_type=( $(grep 'query_cache_type' "${file}" | sed -e 's/^[^=]*=\(.*\).*/\1/' | tr -d '[[:space:]]') )
+  if [ ! -z "${query_cache_size}" -a "${query_cache_size}" == "0" -a -z "${query_cache_type}" -a "${query_cache_type}" != "0" ]; then
+    echo "! Found query_cache_size=0 while query_cache_type has not been set to 0"
+  fi
+
+}
+
+
+calculate_mysql_buffers() {
+  echo "bla"
+
+
+}
+
+host_spec() {
+  host=$1
+  file=$(find "${REPORT_DIR}/${host}" -type f -name 'dmesg_out')
+  if [ -z "${file}" ]; then
+    echo "! dmesg_out is missing for this host!"
+    return
+  fi
+  lines=`wc -l ${file} | awk '{print $1}'`
+  if [ "$lines" -eq 0 ]; then
+    echo "! Empty dmesg file (${file})"
+    return
+  fi
+
+  # CPU details
+  cpu_cores=$(grep 'Total of .* processors' "${file}" | sed -e 's/^Total of \(.*\) processors.*/\1/' | tr -d '[[:space:]]') 
+  cpu_type=$(grep 'CPU0:' "${file}" | grep -v 'Thermal'  | sed -e 's/^CPU0: \(.*\)$/\1/g') 
+  if [ ! -z "$cpu_cores" ]; then
+    echo "- CPU: $cpu_cores cores [ $cpu_type ]"
+  else
+    echo "! Could not detect the number of CPU cores"
+  fi
+
+  # Memory size
+  memory_available=$(grep 'Memory:' "${file}" | sed -e 's/^Memory: \(.*\) available.*/\1/')
+  memory_size_kb=$(echo "$memory_available" | sed -e 's/^\(.*\)k\/\(.*\)k$/\2/')
+  memory_size_gb=$(expr $memory_size_kb / 1024 / 1024)
+  if [ ! -z "$memory_available" ]; then
+    echo "- Memory: $memory_available ( ${memory_size_gb}GB )"
+  else
+    echo "! Could not detect the amount of memory in this system"
+  fi
+
+}
+
 
 while [[ $# > 0  ]]; do
     arg="$1"
@@ -163,10 +243,16 @@ if [ -z REPORT_DIR ]; then
 fi
 
 header "Fetching the cluster ID from the config"
-CMONCNF=$(find ${REPORT_DIR} -type f -name 'cmon_*.cnf')
+CMONCNF=$(find ${REPORT_DIR} -type f -name 'cmon*.cnf')
 if [ ! -z $CMONCNF ]; then
   CLUSTER_ID=`grep 'cluster_id' $CMONCNF | sed -e 's/^cluster_id=\(.*\)/\1/'`
   echo "- Cluster ID: ${CLUSTER_ID}"
+  if [ `basename $CMONCNF` == 'cmon.cnf' ]; then
+    CLUSTER_PREPEND=""
+  else
+    CLUSTER_PREPEND="_${CLUSTER_ID}"
+  fi
+
 else
   echo "- Could not find the cluster ID!"
   echo "- Check if the cmon_<cluster>.cnf is present in the error report and try again."
@@ -174,10 +260,10 @@ else
 fi
 footer
 
+
 if [ $CMON -eq 1 ]; then
-  cmon_version
-  cmon_last_restart
   cluster_info
+  cmon_last_restart
   cmon_errors
 fi
 
